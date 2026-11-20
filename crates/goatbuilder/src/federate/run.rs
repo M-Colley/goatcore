@@ -305,6 +305,7 @@ impl Run {
             Some(p) => (p.lock, p.rechecked),
             None => (PeeringLock::take(&paths.work, with)?, String::new()),
         };
+        super::rotation::commit_surface(with, s, &paths.work)?;
         let mut rows: Vec<Check> = lock
             .removed
             .iter()

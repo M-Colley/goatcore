@@ -176,6 +176,7 @@ pub const RECORD_FILE: &str = "rotation.json";
 
 /// The id of the carrier rotation under way in `work`, or a new one, written
 /// to `<work>/.rotation-carrier` before anything runs.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn carrier_rotation(work: &Path) -> Result<Pending> {
     pending(work, CARRIER_FILE, "carrier")
 }
@@ -195,9 +196,13 @@ pub fn transport_rotation(work: &Path) -> Result<Pending> {
     Ok(t)
 }
 
-/// The id kept in `<work>/<name>`, or a new `<prefix>-<UTC time>` written
-/// there.
+/// The id kept in `<work>/<name>`, or a new `<prefix>-<UTC time>` (written
+/// there when `persist` is true).
 fn pending(work: &Path, name: &str, prefix: &str) -> Result<Pending> {
+    pending_with_write(work, name, prefix, true)
+}
+
+fn pending_with_write(work: &Path, name: &str, prefix: &str, persist: bool) -> Result<Pending> {
     let file = work.join(name);
     let kept = std::fs::read_to_string(&file)
         .ok()
@@ -206,8 +211,14 @@ fn pending(work: &Path, name: &str, prefix: &str) -> Result<Pending> {
         Some(id) => id,
         None => {
             let id = format!("{prefix}-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
-            std::fs::create_dir_all(work).map_err(|e| goat_errors::coded("GB-254", format!("{}: {e}", std::path::Path::new(&(work)).display())))?;
-            std::fs::write(&file, format!("{id}\n")).map_err(|e| goat_errors::coded("GB-254", format!("{}: {e}", std::path::Path::new(&(&file)).display())))?;
+            if persist {
+                std::fs::create_dir_all(work).map_err(|e| {
+                    goat_errors::coded("GB-254", format!("{}: {e}", work.display()))
+                })?;
+                std::fs::write(&file, format!("{id}\n")).map_err(|e| {
+                    goat_errors::coded("GB-254", format!("{}: {e}", file.display()))
+                })?;
+            }
             id
         }
     };
@@ -285,13 +296,22 @@ pub fn transport_run<'a>(o: &Options<'a>, work: &Path) -> Result<(Options<'a>, S
 /// nothing: phase 2 is not in that run. Until phase 2 passes, the command
 /// that carries on is `rotate <partner> carrier` again, which reads the same
 /// id and so is the resume.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn carrier_run<'a>(o: &Options<'a>, work: &Path) -> Result<(Options<'a>, Surface)> {
+    carrier_run_with_write(o, work, true)
+}
+
+fn carrier_run_with_write<'a>(
+    o: &Options<'a>,
+    work: &Path,
+    persist: bool,
+) -> Result<(Options<'a>, Surface)> {
     let from = o.from.max(2);
     let s = Surface {
         stage: "rotate",
         again: (from <= 2).then(|| format!("goatbuilder federate {VERB} {} carrier", o.with)),
         rotate_carrier: if from <= 2 {
-            Some(carrier_rotation(work)?)
+            Some(pending_with_write(work, CARRIER_FILE, "carrier", persist)?)
         } else {
             None
         },
@@ -377,8 +397,10 @@ fn ledger_write(work: &Path, rows: &[serde_json::Value]) -> Result<()> {
     std::fs::write(
         &tmp,
         format!("{}\n", serde_json::json!({ "rotations": rows })),
-    )?;
-    std::fs::rename(tmp, f)?;
+    )
+    .map_err(|e| goat_errors::coded("GB-254", format!("{}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, &f)
+        .map_err(|e| goat_errors::coded("GB-254", format!("{}: {e}", f.display())))?;
     Ok(())
 }
 
@@ -429,6 +451,7 @@ fn agreed_transport(work: &Path) -> Option<String> {
 /// The IPsec rotation for `key` (`ipsec-leaf` or `ipsec-ca`), refused before
 /// anything runs when the flags or the peering do not fit, else the one under
 /// way in `work` (same kind and read-back) or a new one, recorded first.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn ipsec_rotation(
     work: &Path,
     partner: &str,
@@ -436,6 +459,18 @@ pub fn ipsec_rotation(
     readback: Option<&str>,
     retire: Option<&str>,
     phase_11_in_run: bool,
+) -> Result<Ipsec> {
+    ipsec_rotation_with_write(work, partner, key, readback, retire, phase_11_in_run, true)
+}
+
+fn ipsec_rotation_with_write(
+    work: &Path,
+    partner: &str,
+    key: &str,
+    readback: Option<&str>,
+    retire: Option<&str>,
+    phase_11_in_run: bool,
+    persist: bool,
 ) -> Result<Ipsec> {
     let kind = if key == "ipsec-ca" { "ca" } else { "leaf" };
     match agreed_transport(work).as_deref() {
@@ -591,23 +626,9 @@ pub fn ipsec_rotation(
             file: None,
         });
     }
-    let mut rec = serde_json::json!({"kind": kind, "id": id});
-    if let Some(r) = &readback {
-        rec["readback"] = serde_json::json!(r);
+    if persist {
+        write_ipsec_record_and_ledger(work, &file, kind, &id, readback.as_deref(), ledger)?;
     }
-    std::fs::create_dir_all(work)?;
-    std::fs::write(&file, format!("{rec}\n"))?;
-    let mut rows = ledger;
-    let mut row = serde_json::json!({
-        "id": id,
-        "kind": kind,
-        "started": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    });
-    if let Some(r) = &readback {
-        row["readback"] = serde_json::json!(r);
-    }
-    rows.push(row);
-    ledger_write(work, &rows)?;
     Ok(Ipsec {
         id,
         kind,
@@ -615,6 +636,121 @@ pub fn ipsec_rotation(
         retire: false,
         file: Some(file),
     })
+}
+
+fn write_ipsec_record_and_ledger(
+    work: &Path,
+    file: &Path,
+    kind: &str,
+    id: &str,
+    readback: Option<&str>,
+    mut rows: Vec<serde_json::Value>,
+) -> Result<()> {
+    let mut rec = serde_json::json!({"kind": kind, "id": id});
+    if let Some(r) = readback {
+        rec["readback"] = serde_json::json!(r);
+    }
+    std::fs::create_dir_all(work)
+        .map_err(|e| goat_errors::coded("GB-254", format!("{}: {e}", work.display())))?;
+    std::fs::write(file, format!("{rec}\n"))
+        .map_err(|e| goat_errors::coded("GB-254", format!("{}: {e}", file.display())))?;
+    let mut row = serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "started": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    if let Some(r) = readback {
+        row["readback"] = serde_json::json!(r);
+    }
+    rows.push(row);
+    ledger_write(work, &rows)
+}
+
+/// Persist any rotation record prepared in memory by [`rotate`] once
+/// `Run::begin` holds `PeeringLock` on a real execution (`!dry_run` and no
+/// `--mock`). Re-checks `<work>` state under the lock so concurrent callers
+/// cannot overwrite an in-flight rotation.
+pub(super) fn commit_surface(partner: &str, s: &Surface, work: &Path) -> Result<()> {
+    if let Some(c) = &s.rotate_carrier {
+        let kept = std::fs::read_to_string(&c.file)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        match kept {
+            Some(existing) if existing == c.id => {}
+            Some(existing) => {
+                return Err(goat_errors::coded(
+                    "GB-298",
+                    format!(
+                        "{} records carrier rotation '{existing}', not '{}'; run the command again so it resumes '{existing}'. Nothing ran",
+                        c.file.display(),
+                        c.id
+                    ),
+                )
+                .into());
+            }
+            None => {
+                std::fs::create_dir_all(work).map_err(|e| {
+                    goat_errors::coded("GB-254", format!("{}: {e}", work.display()))
+                })?;
+                std::fs::write(&c.file, format!("{}\n", c.id)).map_err(|e| {
+                    goat_errors::coded("GB-254", format!("{}: {e}", c.file.display()))
+                })?;
+            }
+        }
+    }
+    if let Some(i) = &s.rotate_ipsec {
+        if let Some(file) = &i.file {
+            let ledger = ledger_read(work)?;
+            if let Ok(t) = std::fs::read_to_string(file) {
+                let v: Option<serde_json::Value> = serde_json::from_str(&t).ok();
+                let (k, id, r) = match &v {
+                    Some(v) => (
+                        v["kind"].as_str().unwrap_or(""),
+                        v["id"].as_str().unwrap_or(""),
+                        v["readback"].as_str().and_then(fingerprint),
+                    ),
+                    None => ("", "", None),
+                };
+                if k != i.kind || id != i.id || r != i.readback {
+                    return Err(goat_errors::coded(
+                        "GB-298",
+                        format!(
+                            "{} changed before this run took the peering lock ('{id}'); run the command again to resume or inspect the record. Nothing ran",
+                            file.display()
+                        ),
+                    )
+                    .into());
+                }
+            } else {
+                if let Some(open) = ledger
+                    .iter()
+                    .find(|r| has(r, "switched") && !has(r, "retired"))
+                {
+                    let (oid, ok) = (
+                        open["id"].as_str().unwrap_or(""),
+                        open["kind"].as_str().unwrap_or("leaf"),
+                    );
+                    return Err(goat_errors::coded(
+                        "GB-298",
+                        format!(
+                            "the IPsec rotation '{oid}' switched and is not retired, so its set-aside pair is still on the edge: retire it first, once phase 14 passed here after the switch and the partner says theirs did: goatbuilder federate {VERB} {partner} ipsec-{ok} --retire {oid}. Nothing ran"
+                        ),
+                    )
+                    .into());
+                }
+                write_ipsec_record_and_ledger(
+                    work,
+                    file,
+                    i.kind,
+                    &i.id,
+                    i.readback.as_deref(),
+                    ledger,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Phase 11 passes the IPsec rotation to its play, before its `-e fed_work=`.
@@ -711,13 +847,14 @@ pub fn rotate(
     match key {
         "ipsec-leaf" | "ipsec-ca" => {
             let work = super::work_dir(o);
-            let i = ipsec_rotation(
+            let i = ipsec_rotation_with_write(
                 Path::new(&work),
                 o.with,
                 key,
                 readback,
                 retire,
                 o.from <= 11,
+                false,
             )?;
             let mut again = format!("goatbuilder federate {VERB} {} {key}", o.with);
             if let Some(r) = &i.readback {
@@ -735,7 +872,7 @@ pub fn rotate(
         }
         "carrier" => {
             let work = super::work_dir(o);
-            let (o, mut s) = carrier_run(o, Path::new(&work))?;
+            let (o, mut s) = carrier_run_with_write(o, Path::new(&work), false)?;
             super::federate_with(repo, &o, &mut s)
         }
         // A key marked Built without its run here is a mistake in this file.
@@ -1397,5 +1534,141 @@ mod tests {
                 .contains("leaves, carrier, ipsec-leaf, ipsec-ca, transport, signing, ca"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn dry_run_and_locked_or_undeclared_rotate_leave_work_untouched() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fx = repo.join("ops/goatbuilder/fixtures/goatnet-from-scratch/03-boundary-node");
+
+        // 1. Carrier --dry-run on a nonexistent work dir must not create <work> or .rotation-carrier.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_work = tmp.path().join("carrier-dry-work");
+        let missing_s = missing_work.display().to_string();
+        let o_carrier = Options {
+            with: "hello-ally",
+            env: None,
+            r#as: Some("zagros"),
+            edge_group: None,
+            work: Some(&missing_s),
+            mock: Some(&fx),
+            from: 1,
+            to: 99,
+            dry_run: true,
+            table: false,
+        };
+        let r = rotate(&repo, &o_carrier, "carrier", None, None).unwrap();
+        assert_eq!(r.exit, crate::EXIT_OK);
+        assert!(
+            !missing_work.exists(),
+            "carrier --dry-run must not create <work>"
+        );
+
+        // 2. IPsec --dry-run must not write .rotation-ipsec or ipsec-rotations.json,
+        //    so a subsequent ipsec-ca --dry-run is not wedged with GB-298.
+        let ipsec_dir = ipsec_work("ipsec-fips");
+        let ipsec_s = ipsec_dir.path().display().to_string();
+        let o_ipsec = Options {
+            with: "hello-ally",
+            env: None,
+            r#as: Some("zagros"),
+            edge_group: None,
+            work: Some(&ipsec_s),
+            mock: Some(&fx),
+            from: 1,
+            to: 99,
+            dry_run: true,
+            table: false,
+        };
+        let r_leaf = rotate(&repo, &o_ipsec, "ipsec-leaf", None, None).unwrap();
+        assert_eq!(r_leaf.exit, crate::EXIT_OK);
+        assert!(
+            !ipsec_dir.path().join(IPSEC_FILE).exists(),
+            "ipsec-leaf --dry-run must not create .rotation-ipsec"
+        );
+        assert!(
+            !ipsec_dir.path().join(IPSEC_LEDGER).exists(),
+            "ipsec-leaf --dry-run must not create ipsec-rotations.json"
+        );
+        let r_ca = rotate(&repo, &o_ipsec, "ipsec-ca", Some(FP), None)
+            .expect("follow-up ipsec-ca --dry-run must not be wedged by prior dry-run");
+        assert_eq!(r_ca.exit, crate::EXIT_OK);
+
+        // 3. Undeclared peering (GB-149) without --dry-run must not write rotation files before C1 refuses.
+        let fake_repo = tempfile::tempdir().unwrap();
+        let gb_dir = fake_repo.path().join("ops/goatbuilder");
+        std::fs::create_dir_all(&gb_dir).unwrap();
+        std::fs::copy(fx.join("goatbuilder.yaml"), gb_dir.join("goatbuilder.yaml")).unwrap();
+        let undeclared_work = tmp.path().join("undeclared-work");
+        let undeclared_s = undeclared_work.display().to_string();
+        let o_undeclared = Options {
+            with: "no-such-partner",
+            env: None,
+            r#as: None,
+            edge_group: None,
+            work: Some(&undeclared_s),
+            mock: None,
+            from: 1,
+            to: 99,
+            dry_run: false,
+            table: false,
+        };
+        let e = rotate(fake_repo.path(), &o_undeclared, "carrier", None, None).unwrap_err();
+        assert_eq!(code(&e), "GB-149");
+        assert!(
+            !undeclared_work.exists(),
+            "undeclared peering refusal must not create <work>"
+        );
+
+        // 4. Held PeeringLock on real execution must refuse with GB-180 before writing .rotation-ipsec / ledger.
+        let locked_dir = ipsec_work("ipsec-fips");
+        let held = super::super::lock::PeeringLock::take(locked_dir.path(), "hello-ally").unwrap();
+        let locked_s = locked_dir.path().display().to_string();
+        let o_locked = Options {
+            with: "hello-ally",
+            env: None,
+            r#as: Some("zagros"),
+            edge_group: None,
+            work: Some(&locked_s),
+            mock: None,
+            from: 1,
+            to: 99,
+            dry_run: false,
+            table: false,
+        };
+        let locked_err = rotate(fake_repo.path(), &o_locked, "ipsec-leaf", None, None).unwrap_err();
+        assert_eq!(code(&locked_err), "GB-180", "{locked_err}");
+        assert!(
+            !locked_dir.path().join(IPSEC_FILE).exists(),
+            "locked peering must not have .rotation-ipsec written"
+        );
+        assert!(
+            !locked_dir.path().join(IPSEC_LEDGER).exists(),
+            "locked peering must not have ipsec-rotations.json written"
+        );
+
+        // 5. Once PeeringLock is free, Run::begin commits deferred rotation markers under the lock.
+        drop(held);
+        let i_plan =
+            ipsec_rotation_with_write(locked_dir.path(), "hello-ally", "ipsec-leaf", None, None, true, false)
+                .unwrap();
+        assert!(!locked_dir.path().join(IPSEC_FILE).exists());
+        let (_, s_ipsec) = ipsec_run(&o_locked, i_plan.clone(), "again".into());
+        let (mut r_begin, _) = super::super::run::Run::begin(
+            "hello-ally",
+            &locked_s,
+            &[phase(11, "play -e fed_work='/w'")],
+            11,
+            14,
+            &s_ipsec,
+            None,
+        )
+        .unwrap();
+        let _ = r_begin.finish("passed");
+        drop(r_begin);
+        let persisted = std::fs::read_to_string(locked_dir.path().join(IPSEC_FILE)).unwrap();
+        assert!(persisted.contains(&i_plan.id), "{persisted}");
+        let persisted_ledger = std::fs::read_to_string(locked_dir.path().join(IPSEC_LEDGER)).unwrap();
+        assert!(persisted_ledger.contains(&i_plan.id), "{persisted_ledger}");
     }
 }
